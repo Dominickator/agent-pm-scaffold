@@ -1,0 +1,9 @@
+{
+  "expo": {
+    "name": "Pocket Bills",
+    "slug": "pocket-bills",
+    "version": "1.0.0",
+    "sdkVersion": "48.0.0",
+    "platforms": ["ios", "android", "web"]
+  }
+}

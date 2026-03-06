@@ -1,0 +1,9 @@
+{
+  "root": true,
+  "extends": ["eslint:recommended", "plugin:react/recommended", "prettier"],
+  "parser": "@typescript-eslint/parser",
+  "plugins": ["@typescript-eslint", "react"],
+  "env": { "es2021": true, "react-native/react-native": true },
+  "settings": { "react": { "version": "detect" } },
+  "rules": {}
+}
