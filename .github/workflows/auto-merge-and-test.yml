@@ -1,0 +1,173 @@
+name: Auto-merge PRs (rebase) and Run Playwright Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'If true, do not push the test branch (default false)'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  prepare-and-merge:
+    runs-on: ubuntu-latest
+    outputs:
+      test_branch: ${{ steps.set-branch.outputs.branch }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install GitHub CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y gh git
+
+      - name: Authenticate gh
+        env:
+          GITHUB_TOKEN_PAT: ${{ secrets.TOKEN_PAT }}
+        run: |
+          echo "$GITHUB_TOKEN_PAT" | gh auth login --with-token
+
+      - name: Determine repository default branch
+        id: default-branch
+        run: |
+          repo="$GITHUB_REPOSITORY"
+          default_branch=$(gh repo view "$repo" --json defaultBranchRef -q .defaultBranchRef.name)
+          echo "default_branch=$default_branch" >> $GITHUB_OUTPUT
+
+      - name: Create test branch
+        id: set-branch
+        run: |
+          ts=$(date -u +%Y%m%d-%H%M%SZ)
+          BRANCH=tests/merge-run-$ts
+          echo "Branch: $BRANCH"
+          git fetch origin ${{ steps.default-branch.outputs.default_branch }}:refs/remotes/origin/default_branch
+          git checkout -b "$BRANCH" "origin/${{ steps.default-branch.outputs.default_branch }}"
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+
+      - name: List open PRs
+        id: list-prs
+        run: |
+          gh pr list --state open --json number,title,headRefName,headRepositoryOwner --limit 100 > prs.json
+          echo "prs_count=$(jq length prs.json)" >> $GITHUB_OUTPUT
+          cat prs.json
+
+      - name: Attempt rebase of each PR onto test branch
+        id: rebase-loop
+        env:
+          TEST_BRANCH: ${{ steps.set-branch.outputs.branch }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          prs_file=prs.json
+          if [ ! -f "$prs_file" ]; then
+            echo "No PRs file found."; exit 0
+          fi
+
+          failed=0
+          failures=()
+
+          for i in $(jq -r '.[].number' "$prs_file"); do
+            echo "Processing PR #$i"
+            pr_head_ref="pr-$i"
+
+            # fetch PR head into local ref
+            if ! git fetch origin pull/$i/head:$pr_head_ref; then
+              echo "Failed to fetch PR #$i";
+              failures+=("$i:fetch"); failed=1; break
+            fi
+
+            # Checkout PR head
+            git checkout -f $pr_head_ref
+
+            # Attempt to rebase PR branch onto test branch
+            if git rebase "$TEST_BRANCH"; then
+              echo "Rebase of PR #$i onto $TEST_BRANCH succeeded"
+              # Checkout test branch and merge fast-forward
+              git checkout "$TEST_BRANCH"
+              if git merge --ff-only $pr_head_ref; then
+                echo "Fast-forwarded $TEST_BRANCH with PR #$i"
+              else
+                echo "Failed fast-forward merge for PR #$i — attempting non-ff merge"
+                if git merge --no-ff --no-commit $pr_head_ref; then
+                  git commit -m "Merge PR #$i after rebase"
+                else
+                  echo "Merge failed for PR #$i"; failures+=("$i:merge"); failed=1; break
+                fi
+              fi
+            else
+              echo "Rebase conflict for PR #$i — aborting rebase and recording failure"
+              git rebase --abort || true
+              failures+=("$i:rebase-conflict"); failed=1; break
+            fi
+          done
+
+          if [ $failed -ne 0 ]; then
+            echo "Rebase/merge failed for some PRs: ${failures[*]}"
+            echo "failures=${failures[*]}" >> $GITHUB_OUTPUT
+            exit 2
+          fi
+
+          # If dry-run, do not push
+          if [ "${DRY_RUN:-false}" = "true" ]; then
+            echo "Dry run requested — not pushing branch. Test branch available locally in runner only.";
+            exit 0
+          fi
+
+          # Push the test branch
+          git push origin "$TEST_BRANCH"
+
+  run-tests:
+    needs: prepare-and-merge
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Checkout test branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-and-merge.outputs.test_branch }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npx playwright install --with-deps
+
+      - name: Run Playwright tests
+        run: |
+          npm test --silent
+        env:
+          CI: true
+
+      - name: Upload Playwright artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts
+          path: test-results/**
+
+      - name: Post status comment on failure
+        if: failure() && steps.set-branch.outcome == 'success'
+        env:
+          BRANCH: ${{ needs.prepare-and-merge.outputs.test_branch }}
+        run: |
+          echo "Playwright tests failed on $BRANCH"
+          gh pr list --state open --json number -L 100 | jq -r '.[].number' | while read pr; do
+            gh pr comment $pr --body "Automated test run on branch $BRANCH failed. See Actions run for details."
+          done

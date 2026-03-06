@@ -1,0 +1,77 @@
+name: Playwright UI Tests
+
+on:
+  push:
+    branches:
+      - tests/merge-run-*
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npx playwright install --with-deps
+
+      - name: Run Playwright tests
+        run: |
+          npm test --silent
+        env:
+          CI: true
+
+      - name: Upload Playwright trace/artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts
+          path: test-results/**
+
+  gh-actions-utils:
+    needs: test
+    if: ${{ secrets.TOKEN_PAT != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install GitHub CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y gh
+
+      - name: Authenticate gh (using TOKEN_PAT)
+        env:
+          GITHUB_TOKEN_PAT: ${{ secrets.TOKEN_PAT }}
+        run: |
+          echo "$GITHUB_TOKEN_PAT" | gh auth login --with-token
+
+      - name: Example (commented) — merge PRs into this branch safely
+        run: |
+          echo "# The following is an example of how you could merge PRs into the current branch using gh"
+          echo "# Replace PR_NUM with the PR number you want to merge"
+          echo "# WARNING: automated merges can introduce unexpected changes. Prefer manual review or run in a controlled job."
+          echo "# gh pr merge PR_NUM --merge --admin"
+
+      - name: Example (commented) — push artifacts or create a comment
+        run: |
+          echo "# Example: create a comment on a PR (replace PR_NUM and message as needed)"
+          echo "# gh pr comment PR_NUM --body 'Playwright tests completed. See artifacts.'"
+          echo "# Example: push a branch using gh auth (credentials are configured)"
+          echo "# git push origin HEAD:refs/heads/tests/merge-run-EXAMPLE"
